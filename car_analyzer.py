@@ -43,6 +43,10 @@ PROFILE = {
     "prefer_automatic": True,   # 7G-Tronic / auto strongly preferred
     "prefer_diesel_ok": True,   # diesel fine if SCT compliant
     "must_be_sct": True,        # hard requirement — daily Warsaw driving
+    "want_sunroof": True,       # wife wants a sunroof — bonus if present
+    "avoid_damaged": True,      # skip/penalize accident-damaged cars
+    "avoid_rhd": True,          # right-hand-drive (UK import) is a hassle in PL
+    "wary_of_imports": False,   # imports OK but flagged for extra history check
 }
 
 # ── SCT (Warsaw Clean Transport Zone, Jan 2026) ───────────────────────────
@@ -368,25 +372,46 @@ def affordability(price_pln, monthly_total):
     }
 
 
-def negotiation_target(price_pln, market_avg, price_indicator, issues, mileage):
-    """Suggest a realistic offer price."""
+def negotiation_target(price_pln, market_avg, price_indicator, issues, mileage,
+                       days_on_market=0, price_dropped=False, damaged=False):
+    """Suggest a realistic offer price + the leverage points behind it."""
     if price_pln <= 0:
         return None
     base = market_avg if market_avg else price_pln
-    # start from min(asking, market)
     target = min(price_pln, base)
-    # leverage from issues
     crit = sum(1 for s, _ in issues if s == "CRITICAL")
     high = sum(1 for s, _ in issues if s == "HIGH")
-    discount = 0.04 + crit * 0.05 + high * 0.025
+    leverage = []
+    discount = 0.04
+    if crit:
+        discount += crit * 0.05
+        leverage.append(f"{crit} critical engine risk(s)")
+    if high:
+        discount += high * 0.025
+        leverage.append(f"{high} high-severity issue(s)")
     if mileage > 200000:
         discount += 0.03
+        leverage.append("very high mileage")
     if price_indicator == "ABOVE":
         discount += 0.03
-    discount = min(discount, 0.22)
+        leverage.append("Otomoto rates it above market")
+    if days_on_market >= 60:
+        discount += 0.04
+        leverage.append(f"listed {days_on_market} days — stale, seller likely motivated")
+    elif days_on_market >= 30:
+        discount += 0.02
+        leverage.append(f"listed {days_on_market} days")
+    if price_dropped:
+        discount += 0.02
+        leverage.append("price already dropped — momentum on your side")
+    if damaged:
+        discount += 0.05
+        leverage.append("accident history disclosed")
+    discount = min(discount, 0.25)
     target = round(target * (1 - discount) / 100) * 100
     savings = price_pln - target
-    return {"target": target, "savings": max(0, savings), "discount_pct": round(discount * 100)}
+    return {"target": target, "savings": max(0, savings),
+            "discount_pct": round(discount * 100), "leverage": leverage}
 
 
 def three_year_tco(price_pln, costs, market_avg):
@@ -436,6 +461,21 @@ def personal_fit_score(car):
     # CEPiK verified = trust
     if car.get("cepik"):
         score += 3
+    # accident damage — big red flag
+    if PROFILE["avoid_damaged"] and car.get("damaged"):
+        score -= 25
+    # right-hand drive import — hassle in Poland
+    if PROFILE["avoid_rhd"] and car.get("rhd"):
+        score -= 12
+    # imported — minor caution
+    if car.get("imported") and PROFILE["wary_of_imports"]:
+        score -= 5
+    # sunroof — wife wants it
+    if PROFILE["want_sunroof"] and car.get("sunroof"):
+        score += 5
+    # price already dropped = motivated seller
+    if car.get("price_dropped"):
+        score += 2
     return max(0, min(100, round(score)))
 
 
@@ -562,7 +602,11 @@ def build_car(raw):
     score = score_car(price_pln, mileage, year, sct_ok, issues, market_avg, odo_flag)
     costs = estimate_monthly_cost(fuel_val, raw["engine_cap"], engine_code, price_pln)
     afford = affordability(price_pln, costs["total"])
-    nego = negotiation_target(price_pln, market_avg, raw.get("price_indicator"), issues, mileage)
+    damaged = raw.get("damaged", False)
+    days_on_market = raw.get("days_on_market", 0)
+    price_dropped = raw.get("price_dropped", False)
+    nego = negotiation_target(price_pln, market_avg, raw.get("price_indicator"), issues,
+                              mileage, days_on_market, price_dropped, damaged)
     tco = three_year_tco(price_pln, costs, market_avg)
 
     td_list = TEST_DRIVE_CHECKLIST.get(engine_code or "Unknown", TEST_DRIVE_CHECKLIST["Unknown"])
@@ -606,6 +650,19 @@ def build_car(raw):
         "afford": afford,
         "nego": nego,
         "tco": tco,
+        # deep-scan enrichment (present when detail page fetched)
+        "damaged": damaged,
+        "imported": raw.get("imported", False),
+        "rhd": raw.get("rhd", False),
+        "sunroof": raw.get("sunroof", False),
+        "has_dpf": raw.get("has_dpf", False),
+        "days_on_market": days_on_market,
+        "price_dropped": price_dropped,
+        "price_drop_amount": raw.get("price_drop_amount", 0),
+        "equipment": raw.get("equipment", []),
+        "description": raw.get("description", ""),
+        "deep": raw.get("deep", False),
+        "source": raw.get("source", "otomoto"),
     }
     car["fit"] = personal_fit_score(car)
     return car
@@ -707,7 +764,7 @@ def _node_to_car(node):
     }
 
 
-def fetch_search(search_url, max_pages=10, max_cars=120):
+def fetch_search(search_url, max_pages=10, max_cars=120, deep=False):
     """Paste an otomoto SEARCH URL → pull every listing across result pages."""
     cars = []
     seen = set()
@@ -761,52 +818,68 @@ def fetch_search(search_url, max_pages=10, max_cars=120):
         if len(cars) >= max_cars or new_this_page == 0:
             break
         time.sleep(0.6)
+
+    cars = cars[:max_cars]
+    if deep and cars:
+        print(f"\nDeep scan: fetching detail page for {len(cars)} cars "
+              f"(accident/import/sunroof/days-listed)...")
+        enriched = []
+        for i, c in enumerate(cars, 1):
+            enriched.append(enrich_with_detail(c))
+            if i % 10 == 0 or i == len(cars):
+                print(f"  enriched {i}/{len(cars)}")
+            time.sleep(0.4)
+        cars = enriched
     return cars
 
 
-def fetch_listing(url):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
+EQUIPMENT_HIGHLIGHTS = {
+    "sunroof": "Sunroof", "navigation_system": "Navigation", "leather_upholstery": "Leather",
+    "upholstery_type": "Leather", "heated_seat_driver": "Heated seats",
+    "rear_view_camera": "Rear camera", "360_view_camera": "360° camera",
+    "park_assistant": "Park assist", "adaptive-cruise-control": "Adaptive cruise",
+    "cruisecontrol_type": "Cruise control", "keyless_go": "Keyless go",
+    "head_up_display": "Head-up display", "memory_seat": "Memory seats",
+    "distance_control": "Distance control", "lane_control_assistant": "Lane assist",
+    "led": "LED lights", "xenon": "Xenon lights",
+}
+
+
+def _days_since(iso_str):
+    if not iso_str:
+        return 0
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        return None, f"Failed to fetch URL: {e}"
+        dt = datetime.strptime(iso_str[:10], "%Y-%m-%d")
+        return max(0, (datetime.now() - dt).days)
+    except (ValueError, TypeError):
+        return 0
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not next_data_tag:
-        return None, "Could not find __NEXT_DATA__ in page"
 
-    try:
-        data = json.loads(next_data_tag.string)
-    except Exception as e:
-        return None, f"JSON parse error: {e}"
-
-    try:
-        advert = data["props"]["pageProps"]["advert"]
-    except (KeyError, TypeError):
-        return None, "Listing data not found — paste a single listing URL, not a search page"
-
-    if not advert:
-        return None, "Empty advert data"
-
+def _advert_to_raw(advert, url):
+    """Extract a full raw dict from an otomoto detail-page advert object."""
     details = {d["key"]: d["value"] for d in advert.get("details", []) if "key" in d and "value" in d}
+    pdict = advert.get("parametersDict", {}) or {}
 
-    # Price
-    price_raw = advert.get("price", {})
-    currency = price_raw.get("currency", "PLN")
+    def param_val(key):
+        v = pdict.get(key, {}).get("values")
+        if v and isinstance(v, list):
+            return v[0].get("value", "")
+        return ""
+
+    def is_yes(key):
+        return param_val(key) == "1"
+
+    price_raw = advert.get("price", {}) or {}
+    currency = price_raw.get("currency") or (price_raw.get("amount", {}) or {}).get("currencyCode", "PLN")
     try:
         price_num = float(str(price_raw.get("value", "0")).replace(" ", "").replace("\xa0", ""))
     except (ValueError, TypeError):
         price_num = 0
+    if not price_num:
+        try:
+            price_num = float((price_raw.get("amount", {}) or {}).get("units", 0))
+        except (ValueError, TypeError):
+            price_num = 0
     if currency == "EUR":
         price_pln = round(price_num * EUR_TO_PLN)
         price_display = f"{price_num:,.0f} EUR (~{price_pln:,} PLN)"
@@ -814,94 +887,183 @@ def fetch_listing(url):
         price_pln = round(price_num)
         price_display = f"{price_pln:,} PLN"
 
-    title = advert.get("title", "Unknown")
-
     try:
-        year = int(details.get("year", "0"))
+        year = int(details.get("year", "0") or param_val("year") or 0)
     except (ValueError, TypeError):
         year = 0
-
     try:
-        mileage = int(str(details.get("mileage", "0")).replace(" ", "").replace("\xa0", "").replace("km", ""))
+        mileage = int(re.sub(r"[^\d]", "", str(details.get("mileage", "")) or param_val("mileage") or "0") or 0)
     except (ValueError, TypeError):
         mileage = 0
 
-    fuel_val = details.get("fuel_type", "")
-    engine_cap = details.get("engine_capacity", "")
-    power_val = details.get("engine_power", "")
-    transmission = details.get("gearbox", "")
-    color = details.get("color", "")
-    version = details.get("version", "")
-    body_type = details.get("body_type", "")
-    vin_raw = details.get("vin", "") or advert.get("vin", "")
-    # VINs from otomoto are encrypted — just note presence
-    has_vin = bool(vin_raw and len(vin_raw) > 5 and " " not in vin_raw[:5])
-    generation_detail = details.get("generation", "")
+    vin_raw = param_val("vin") or details.get("vin", "")
+    has_vin = is_yes("has_vin") or bool(vin_raw and len(vin_raw) > 10)
 
-    seller_name = ""
-    seller_type = ""
-    location = ""
-    try:
-        seller = advert.get("seller", {}) or {}
-        seller_name = seller.get("name", "")
-        seller_type = seller.get("type", "")
-        loc = seller.get("location", {}) or {}
-        city = loc.get("city", "") or ""
-        region = loc.get("region", "") or ""
-        if city and region:
-            location = f"{city}, {region}"
-        elif city:
-            location = city
-        elif region:
-            location = region
-    except (KeyError, TypeError, AttributeError):
-        pass
+    seller = advert.get("seller", {}) or {}
+    loc = seller.get("location", {}) or {}
+    city = loc.get("city", "") or ""
+    region = loc.get("region", "") or ""
+    location = ", ".join(x for x in (city, region) if x)
 
     photos = []
     try:
-        for p in (advert.get("images", {}) or {}).get("photos", [])[:4]:
-            u = p.get("url", "")
+        for p in (advert.get("images", {}) or {}).get("photos", [])[:12]:
+            u = p.get("url") or (p.get("750x300") if isinstance(p, dict) else "")
             if u:
                 photos.append(u)
     except (KeyError, TypeError, AttributeError):
         pass
 
-    # otomoto's own price evaluation + CEPiK verification, if present
-    price_indicator = None
+    # equipment highlights (sunroof matters to wife, etc.)
+    equip = []
+    sunroof = bool(param_val("sunroof"))
+    if sunroof:
+        equip.append("Sunroof")
+    for k, label in EQUIPMENT_HIGHLIGHTS.items():
+        if k == "sunroof":
+            continue
+        if is_yes(k) or (param_val(k) and param_val(k) not in ("0", "")):
+            if label not in equip:
+                equip.append(label)
+    # also scan equipment list array if present
     try:
-        price_indicator = (advert.get("priceEvaluation", {}) or {}).get("indicator")
+        for grp in advert.get("equipment", []) or []:
+            for item in grp.get("values", []) or []:
+                lbl = item.get("label", "") if isinstance(item, dict) else str(item)
+                low = lbl.lower()
+                if "szyberdach" in low or "panoram" in low:
+                    sunroof = True
+                    if "Sunroof" not in equip:
+                        equip.append("Sunroof")
     except (AttributeError, TypeError):
         pass
-    cepik = bool(advert.get("cepikVerified") or details.get("cepik_verified"))
 
-    raw = {
+    created = advert.get("originalCreatedAt") or advert.get("createdAt") or ""
+    days_on_market = _days_since(created)
+    pd_obj = advert.get("priceDrop")
+    price_dropped = bool(pd_obj)
+    price_drop_amount = 0
+    if isinstance(pd_obj, dict):
+        try:
+            price_drop_amount = int(float(pd_obj.get("amount", 0) or 0))
+        except (ValueError, TypeError):
+            pass
+
+    price_indicator = (advert.get("priceEvaluation", {}) or {}).get("indicator")
+
+    return {
         "url": url,
-        "title": title,
+        "title": advert.get("title", "Unknown"),
         "price_pln": price_pln,
         "price_display": price_display,
         "currency": currency,
         "year": year,
         "mileage": mileage,
-        "fuel": fuel_val,
-        "engine_cap": engine_cap,
-        "power": power_val,
-        "transmission": transmission,
-        "color": color,
-        "version": version,
-        "body_type": body_type,
+        "fuel": details.get("fuel_type", "") or pdict.get("fuel_type", {}).get("values", [{}])[0].get("label", ""),
+        "engine_cap": details.get("engine_capacity", ""),
+        "power": re.sub(r"[^\d]", "", details.get("engine_power", "") or param_val("engine_power") or ""),
+        "transmission": details.get("gearbox", ""),
+        "color": details.get("color", ""),
+        "version": details.get("version", ""),
+        "body_type": details.get("body_type", ""),
         "has_vin": has_vin,
-        "seller": seller_name,
-        "seller_type": seller_type,
+        "seller": seller.get("name", ""),
+        "seller_type": seller.get("type", ""),
         "location": location,
-        "generation_hint": generation_detail,
+        "generation_hint": details.get("generation", "") + " " + details.get("version", ""),
         "photos": photos,
         "price_indicator": price_indicator,
-        "cepik": cepik,
+        "cepik": bool(advert.get("cepikVerified") or advert.get("verifiedCar")),
+        "badges": [b for b in (advert.get("badges") or []) if isinstance(b, str)],
+        # rich deep-scan fields
+        "damaged": is_yes("damaged"),
+        "imported": is_yes("is_imported_car"),
+        "rhd": param_val("rhd") == "1",  # 1 = right-hand drive
+        "sunroof": sunroof,
+        "has_dpf": is_yes("particle_filter"),
+        "days_on_market": days_on_market,
+        "price_dropped": price_dropped,
+        "price_drop_amount": price_drop_amount,
+        "equipment": equip,
+        "description": (advert.get("description", "") or "")[:600],
+        "deep": True,
+        "source": "otomoto",
     }
-    return build_car(raw), None
+
+
+def fetch_listing(url):
+    try:
+        data = _get_next_data(url)
+    except Exception as e:
+        return None, f"Failed to fetch URL: {e}"
+    if not data:
+        return None, "Could not find __NEXT_DATA__ in page"
+    try:
+        advert = data["props"]["pageProps"]["advert"]
+    except (KeyError, TypeError):
+        return None, "Listing data not found — paste a single listing URL, not a search page"
+    if not advert:
+        return None, "Empty advert data"
+    return build_car(_advert_to_raw(advert, url)), None
+
+
+def enrich_with_detail(car):
+    """Fetch the detail page for a search-result car and merge rich fields in."""
+    try:
+        data = _get_next_data(car["url"])
+        advert = data["props"]["pageProps"]["advert"]
+        if not advert:
+            return car
+        return build_car(_advert_to_raw(advert, car["url"]))
+    except Exception:
+        return car  # keep the shallow node data on any failure
 
 
 # ── HTML generation ───────────────────────────────────────────────────────
+
+def build_nego_modal(car, idx):
+    nego = car.get("nego") or {}
+    target = nego.get("target", car["price"])
+    leverage = nego.get("leverage", [])
+    lev_html = "".join(f"<li>{l}</li>" for l in leverage) or "<li>Standard market negotiation room</li>"
+    # ready-to-send Polish + English message
+    msg = (f"Dzień dobry, jestem zainteresowany tym samochodem ({car['title']}). "
+           f"Po przeanalizowaniu rynku i stanu auta mogę zaproponować {target:,} PLN. "
+           f"Czy ta kwota jest do negocjacji? Chętnie umówię się na oględziny i jazdę próbną "
+           f"z diagnostyką OBD. Pozdrawiam.").replace(",", " ")
+    msg_js = msg.replace("'", "\\'").replace("\n", " ")
+    return f"""
+    <div id="nego{idx}" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;overflow-y:auto">
+      <div style="background:white;max-width:560px;margin:60px auto;border-radius:12px;padding:26px;position:relative">
+        <button onclick="document.getElementById('nego{idx}').style.display='none'"
+          style="position:absolute;top:12px;right:16px;background:none;border:none;font-size:20px;cursor:pointer">✕</button>
+        <h3 style="margin-bottom:6px;font-size:17px">🤝 Negotiation plan</h3>
+        <p style="color:#666;font-size:13px;margin-bottom:14px">{car['title']}</p>
+        <div style="display:flex;gap:14px;margin-bottom:14px">
+          <div style="flex:1;background:#f8f9fa;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:11px;color:#888">ASKING</div>
+            <div style="font-size:18px;font-weight:700">{car['price']:,}</div>
+          </div>
+          <div style="flex:1;background:#d1e7dd;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:11px;color:#0a3622">YOUR OFFER</div>
+            <div style="font-size:18px;font-weight:700;color:#0a3622">{target:,}</div>
+          </div>
+          <div style="flex:1;background:#fff3cd;border-radius:8px;padding:12px;text-align:center">
+            <div style="font-size:11px;color:#664d03">SAVE</div>
+            <div style="font-size:18px;font-weight:700;color:#664d03">{nego.get('savings',0):,}</div>
+          </div>
+        </div>
+        <h4 style="font-size:14px;margin-bottom:6px">Your leverage points:</h4>
+        <ul style="padding-left:20px;color:#444;font-size:13px;margin-bottom:14px">{lev_html}</ul>
+        <h4 style="font-size:14px;margin-bottom:6px">Ready-to-send message (Polish):</h4>
+        <textarea id="negomsg{idx}" readonly style="width:100%;height:90px;font-size:13px;padding:8px;
+          border:1px solid #dee2e6;border-radius:6px;resize:vertical">{msg}</textarea>
+        <button onclick="navigator.clipboard.writeText(document.getElementById('negomsg{idx}').value);this.textContent='✓ Copied!'"
+          style="margin-top:8px;background:#198754;color:white;border:none;padding:7px 14px;
+          border-radius:6px;font-size:13px;cursor:pointer">📋 Copy message</button>
+      </div>
+    </div>"""
+
 
 def severity_badge(s):
     cfg = {
@@ -1112,6 +1274,46 @@ def build_html(cars):
                       '<span style="background:#f8d7da;color:#842029;padding:1px 6px;border-radius:3px;'
                       'font-size:10px;font-weight:600">MANUAL</span>')
 
+        # deep-scan condition badges
+        flag_badges = ""
+        if c.get("damaged"):
+            flag_badges += ('<span style="background:#dc3545;color:#fff;padding:1px 6px;border-radius:3px;'
+                            'font-size:10px;font-weight:700">⚠ ACCIDENT</span> ')
+        if c.get("rhd"):
+            flag_badges += ('<span style="background:#842029;color:#fff;padding:1px 6px;border-radius:3px;'
+                            'font-size:10px;font-weight:700">↔ RIGHT-HAND DRIVE</span> ')
+        if c.get("imported"):
+            flag_badges += ('<span style="background:#fff3cd;color:#664d03;padding:1px 6px;border-radius:3px;'
+                            'font-size:10px;font-weight:600">🌍 Imported</span> ')
+        if c.get("sunroof"):
+            flag_badges += ('<span style="background:#cff4fc;color:#055160;padding:1px 6px;border-radius:3px;'
+                            'font-size:10px;font-weight:600">☀ Sunroof</span> ')
+        if c.get("deep") and not c.get("damaged"):
+            flag_badges += ('<span style="background:#d1e7dd;color:#0a3622;padding:1px 6px;border-radius:3px;'
+                            'font-size:10px;font-weight:600">✓ No accident declared</span> ')
+
+        # days on market / price drop
+        market_time_html = ""
+        dom = c.get("days_on_market", 0)
+        if dom >= 60:
+            market_time_html = (f'<div style="font-size:11px;color:#664d03;background:#fff3cd;'
+                                f'padding:2px 6px;border-radius:4px;margin-top:3px">🕐 Listed {dom} days — stale, negotiate hard</div>')
+        elif dom >= 1:
+            market_time_html = f'<div style="font-size:11px;color:#777;margin-top:3px">🕐 Listed {dom} days ago</div>'
+        if c.get("price_dropped"):
+            drop = c.get("price_drop_amount", 0)
+            extra = f" (−{drop:,} PLN)" if drop else ""
+            market_time_html += (f'<div style="font-size:11px;color:#0a3622;background:#d1e7dd;'
+                                 f'padding:2px 6px;border-radius:4px;margin-top:3px">📉 Price already dropped{extra}</div>')
+
+        # equipment highlights
+        equip_html = ""
+        if c.get("equipment"):
+            chips = " ".join(
+                f'<span style="background:#f1f3f5;color:#495057;padding:1px 6px;border-radius:3px;font-size:10px">{e}</span>'
+                for e in c["equipment"][:8])
+            equip_html = f'<div style="display:flex;gap:3px;flex-wrap:wrap;margin-top:6px">{chips}</div>'
+
         # affordability
         af = c["afford"]
         afford_html = (
@@ -1124,8 +1326,10 @@ def build_html(cars):
         nego_html = ""
         if c["nego"] and c["nego"]["savings"] > 0:
             nego_html = (f'<div style="margin-top:5px;font-size:11px;color:#0a3622;background:#d1e7dd;'
-                         f'padding:3px 6px;border-radius:4px">🤝 Offer ~{c["nego"]["target"]:,} PLN '
-                         f'(-{c["nego"]["discount_pct"]}%, save {c["nego"]["savings"]:,})</div>')
+                         f'padding:3px 6px;border-radius:4px;cursor:pointer" '
+                         f'onclick="document.getElementById(\'nego{idx}\').style.display=\'flex\'">'
+                         f'🤝 Offer ~{c["nego"]["target"]:,} PLN '
+                         f'(-{c["nego"]["discount_pct"]}%, save {c["nego"]["savings"]:,}) · click for message</div>')
         # 3yr tco
         tco_html = (f'<div style="margin-top:5px;font-size:11px;color:#555">'
                     f'3-yr cost ~{c["tco"]["total"]:,} PLN ({c["tco"]["per_month"]:,}/mo)</div>')
@@ -1133,22 +1337,29 @@ def build_html(cars):
         rows += f"""
         <tr data-fit="{c.get('fit', c['score'])}" data-score="{c['score']}" data-price="{c['price']}"
             data-year="{c['year']}" data-mileage="{c['mileage']}"
-            data-sct="{1 if c['sct_ok'] else 0}" data-auto="{1 if is_auto else 0}" data-fuel="{fuel_class}">
+            data-sct="{1 if c['sct_ok'] else 0}" data-auto="{1 if is_auto else 0}" data-fuel="{fuel_class}"
+            data-damaged="{1 if c.get('damaged') else 0}" data-sunroof="{1 if c.get('sunroof') else 0}"
+            data-idx="{idx}">
           <td style="text-align:center;vertical-align:middle;min-width:90px">
             {score_ring(c.get('fit', c['score']))}
             <div style="font-size:9px;color:#999;margin-top:2px">FIT · cond {c['score']}</div>
+            <button onclick="toggleStar({idx})" id="star{idx}" title="Add to shortlist"
+              style="background:none;border:none;font-size:20px;cursor:pointer;margin-top:4px;opacity:.35">⭐</button>
           </td>
           <td style="min-width:220px">
             {photos_html}
             <a href="{c['url']}" target="_blank"
                style="font-weight:700;color:#0d6efd;text-decoration:none;font-size:14px">{c['title']}</a>
-            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">{auto_badge} {cepik_badge} {pi_badge} {otomoto_badges}</div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:5px">{flag_badges}</div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">{auto_badge} {cepik_badge} {pi_badge} {otomoto_badges}</div>
             <div style="font-size:12px;color:#666;margin-top:4px">
               {c['generation']} · {c['engine_code']} · {c.get('body_type','')}
             </div>
             <div style="font-size:12px;color:#666">{c['location']}</div>
             <div style="font-size:12px;margin-top:2px">{seller_badge} {c['seller'][:30]}</div>
             <div style="margin-top:4px">{vin_html}</div>
+            {market_time_html}
+            {equip_html}
             <div style="margin-top:6px">
               <button onclick="document.getElementById('modal{idx}').style.display='flex'"
                 style="background:#0d6efd;color:white;border:none;padding:4px 10px;border-radius:5px;
@@ -1183,6 +1394,7 @@ def build_html(cars):
         </tr>"""
 
         modals += build_checklist_modal(c, idx)
+        modals += build_nego_modal(c, idx)
 
     csv_data = cars_to_csv(cars).replace("\\", "\\\\").replace("`", "\\`").replace("</", "<\\/")
     sort_js = """
@@ -1205,6 +1417,8 @@ def build_html(cars):
         maxP === Infinity ? 'Any' : maxP.toLocaleString() + ' PLN';
       const sctOnly = document.getElementById('fSct').checked;
       const autoOnly = document.getElementById('fAuto').checked;
+      const noCrash = document.getElementById('fNoCrash').checked;
+      const sunOnly = document.getElementById('fSun').checked;
       const fuel = document.getElementById('fFuel').value;
       let shown = 0;
       document.querySelectorAll('tbody tr').forEach(r => {
@@ -1212,6 +1426,8 @@ def build_html(cars):
         if (parseFloat(r.dataset.price) > maxP) ok = false;
         if (sctOnly && r.dataset.sct !== '1') ok = false;
         if (autoOnly && r.dataset.auto !== '1') ok = false;
+        if (noCrash && r.dataset.damaged === '1') ok = false;
+        if (sunOnly && r.dataset.sunroof !== '1') ok = false;
         if (fuel !== 'all' && r.dataset.fuel !== fuel) ok = false;
         r.style.display = ok ? '' : 'none';
         if (ok) shown++;
@@ -1225,6 +1441,26 @@ def build_html(cars):
       a.href = URL.createObjectURL(blob);
       a.download = 'mercedes_analysis.csv';
       a.click();
+    }
+    const starred = new Set();
+    function toggleStar(idx) {
+      const btn = document.getElementById('star' + idx);
+      if (starred.has(idx)) { starred.delete(idx); btn.style.opacity = '.35'; }
+      else { starred.add(idx); btn.style.opacity = '1'; }
+      const bar = document.getElementById('shortlistBar');
+      document.getElementById('starCount').textContent = starred.size;
+      bar.style.display = starred.size ? 'flex' : 'none';
+    }
+    function showShortlistOnly() {
+      document.querySelectorAll('tbody tr').forEach(r => {
+        r.style.display = starred.has(parseInt(r.dataset.idx)) ? '' : 'none';
+      });
+    }
+    function clearShortlist() {
+      starred.forEach(i => { document.getElementById('star'+i).style.opacity='.35'; });
+      starred.clear();
+      document.getElementById('shortlistBar').style.display = 'none';
+      applyFilters();
     }
     """
 
@@ -1245,6 +1481,8 @@ def build_html(cars):
       </div>
       <label style="font-size:13px"><input type="checkbox" id="fSct" onchange="applyFilters()"> SCT compliant only</label>
       <label style="font-size:13px"><input type="checkbox" id="fAuto" onchange="applyFilters()"> Automatic only</label>
+      <label style="font-size:13px"><input type="checkbox" id="fNoCrash" onchange="applyFilters()"> Hide accident cars</label>
+      <label style="font-size:13px"><input type="checkbox" id="fSun" onchange="applyFilters()"> Sunroof only</label>
       <div>
         <label style="font-size:12px;color:#666">Fuel:
           <select id="fFuel" onchange="applyFilters()" style="font-size:13px;padding:2px">
@@ -1260,6 +1498,16 @@ def build_html(cars):
         <button onclick="downloadCSV()" style="background:#198754;color:white;border:none;
           padding:7px 14px;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600">⬇ Export CSV</button>
       </div>
+    </div>
+    <div id="shortlistBar" style="display:none;background:#0f0c29;color:white;border-radius:10px;
+      padding:12px 18px;margin-bottom:16px;align-items:center;gap:16px">
+      <span style="font-weight:600">⭐ Shortlist: <b id="starCount">0</b> cars</span>
+      <button onclick="showShortlistOnly()" style="background:#0d6efd;color:white;border:none;
+        padding:6px 14px;border-radius:6px;font-size:13px;cursor:pointer">Show only shortlist</button>
+      <button onclick="applyFilters()" style="background:#495057;color:white;border:none;
+        padding:6px 14px;border-radius:6px;font-size:13px;cursor:pointer">Show all again</button>
+      <button onclick="clearShortlist()" style="background:none;color:#aaa;border:1px solid #555;
+        padding:6px 14px;border-radius:6px;font-size:13px;cursor:pointer">Clear</button>
     </div>
     <script type="text/plain" id="csvData">{csv_data}</script>"""
     return f"""<!DOCTYPE html>
@@ -1375,8 +1623,11 @@ def main():
             pages = int(pages)
         except ValueError:
             pages = 5
-        print(f"\nFetching up to {pages} pages...")
-        cars = fetch_search(search_url, max_pages=pages)
+        deep_in = input("Deep scan each car for accident/import/sunroof/days-listed? "
+                        "Slower but far more accurate (y/N): ").strip().lower()
+        deep = deep_in in ("y", "yes")
+        print(f"\nFetching up to {pages} pages{' + deep scan' if deep else ''}...")
+        cars = fetch_search(search_url, max_pages=pages, deep=deep)
     else:
         print("\nPaste otomoto listing URLs one per line. Blank line when done.\n")
         urls = []

@@ -7,16 +7,22 @@ A Python tool that scrapes otomoto.pl listings, scores every car, and opens an i
 ## Features
 
 - **Bulk search mode** — paste one otomoto search URL, auto-fetches every car across all result pages
-- **Personal fit score** — combines condition, SCT compliance, budget, running cost, auto preference
+- **Deep scan** — optionally opens each listing's full detail page to extract accident history, import status, sunroof, DPF, full equipment, and how long it's been listed
+- **Personal fit score** — combines condition, SCT compliance, budget, running cost, auto preference, accident/import/sunroof flags
 - **Honest money math** — age-adjusted insurance (young drivers pay 2-3× more), 3-year TCO, monthly fuel/insurance/depreciation/maintenance
 - **Affordability verdict** — per-car "Within budget / Stretch / Too expensive"
-- **Negotiation target** — suggested offer price with discount % based on issues + mileage
+- **Negotiation plan** — suggested offer price + the leverage points behind it + a ready-to-copy Polish message to send the seller
+- **Accident / import / RHD / sunroof flags** — red badges for crash-damaged or right-hand-drive cars; ☀ sunroof bonus
+- **Days-on-market + price-drop signals** — stale listings = motivated sellers = harder negotiation
 - **Warsaw SCT 2026** — hard flags any non-compliant car (diesel < 2011 or petrol < 2005)
 - **Known engine issues** — OM651 balance shaft, M271 timing chain, M272 balance shaft, M276 chain stretch, etc.
 - **Otomoto signals** — surfaces platform's own BELOW/AT/ABOVE market rating, CEPiK verification, badges
-- **Live HTML filters** — price slider, SCT-only, automatic-only, fuel type toggle
+- **Shortlist + compare** — ⭐ any car, then show only your shortlist
+- **Live HTML filters** — price slider, SCT-only, automatic-only, hide-accident, sunroof-only, fuel type
 - **CSV export** — one click downloads full data as spreadsheet
 - **Test drive checklist** — per-engine checklist modal + seller questions
+
+> **Marketplace support:** otomoto.pl (the dominant Polish marketplace) is fully supported. autoscout24.pl and mobile.de use heavy anti-bot protection and are not reliably scrapable, so they are intentionally not included — a flaky scraper is worse than none. The code is source-aware so other sites can be added cleanly later.
 
 ---
 
@@ -80,9 +86,12 @@ Mode (1/2, default 1):
 ```
 Paste otomoto search URL: https://www.otomoto.pl/osobowe/mercedes-benz/c-klasa/...
 How many result pages to scan? (default 5): 3
+Deep scan each car for accident/import/sunroof/days-listed? (y/N): y
 ```
 
 Scans ~32 cars per page. 3 pages = ~96 cars analyzed automatically.
+
+**Deep scan** (recommended): answer `y` to open each car's full detail page. Slower (~0.4s per car) but unlocks accident history, import/RHD flags, sunroof, full equipment list, and days-on-market — the data that actually decides whether a car is worth seeing.
 
 ### Mode 2 — Individual listings
 
